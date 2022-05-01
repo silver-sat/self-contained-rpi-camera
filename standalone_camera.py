@@ -11,6 +11,8 @@ class uCAM_III(object):
     default_resetPin = 23
     # time to wait before reading camera response
     default_responseDelay = 1
+    # time to wait for reading camera reponse to sync
+    default_syncResponseDelay = 1
     # time to wait between commands
     default_interCommandDelay = 1
 
@@ -33,6 +35,7 @@ class uCAM_III(object):
     def __init__(self,**kw):
         self.resetPin = kw.get('resetPin',self.default_resetPin)
         self.responseDelay = kw.get('responseDelay',self.default_responseDelay)
+        self.syncResponseDelay = kw.get('syncResponseDelay',self.default_syncResponseDelay)
         self.interCommandDelay = kw.get('interCommandDelay',self.default_interCommandDelay)
         self.verbose = kw.get('verbose',False)
         GPIO.setup(self.resetPin,GPIO.OUT)
@@ -60,22 +63,28 @@ class uCAM_III(object):
             print("Read: ",len(retval),":"," ".join(map(lambda b: "%02X"%b,retval)))
         return retval
 
-    def sync(self):
+    def check_ack(self,reply,cmd):
+        return tuple(map(int,reply[:3])) == (0xAA,0x0E,cmd)
+
+    def check_sync_ack(self,reply):
+        return self.check_ack(reply,0x0D)
+
+    def sync(self,**kw):
+        syncResponseDelay = kw.get('syncResponseDelay',self.syncResponseDelay)
         maxTries = 60
         currentTry = 0
         reply = b''
         delayValue = 0.005
         delayIncrement = 0.001
     
-        while (currentTry < maxTries) and (len(reply) != 12 or reply[:3] != b'\xaa\x0e\x0d'):
+        while (currentTry < maxTries) and (len(reply) != 12 or not self.check_sync_ack(reply)):
             # print("Sync attempt:",currentTry)
             delayValue += delayIncrement
-            reply = self.command(self.SYNC, responseDelay=0.05, wait=False)
+            reply = self.command(self.SYNC, responseDelay=syncResponseDelay, wait=False)
             currentTry +=1
 
-        if len(reply) != 12 or reply[:3] != b'\xaa\x0e\x0d':
+        if len(reply) != 12 or not self.check_sync_ack(reply):
             # Didn't work
-            print(reply[:3])
             print("Sync didn't work. Sent %d tries" % currentTry)
             return False
 
@@ -85,17 +94,17 @@ class uCAM_III(object):
         bytes = self.ACK+(0x0D,0x00,0x00,0x00)
         if self.verbose:
             print("Write:",len(bytes),":"," ".join(map(lambda b: "%02X"%b,bytes)))
-        response = self.write(self.ACK+(0x0D,0x00,0x00,0x00))
+        response = self.write(bytes)
         return True
 
     def takephoto(self):
-        self.command(self.INITIAL_JPEG)
+        reply = self.command(self.INITIAL_JPEG)
         time.sleep(self.interCommandDelay)
-        self.command(self.SET_PKG_SIZE)
+        reply = self.command(self.SET_PKG_SIZE)
         time.sleep(self.interCommandDelay)
-        self.command(self.EXPSETTINGS)
+        reply = self.command(self.EXPSETTINGS)
         time.sleep(self.interCommandDelay)
-        self.command(self.SNAPSHOT)
+        reply = self.command(self.SNAPSHOT)
 
     def retrieveDataFromPkg(self,pkg):
         # pkgID = pkg[0:2]
@@ -221,23 +230,33 @@ def button_callback(channel):
 
 button = Button(buttonPin=24, callback=button_callback)
 
-camera = uCAM_III_Serial(serialDevice="/dev/serial0", 
-                         resetPin=23,
-                         responseDelay=0.2,
-                         verbose=True)
+connection = "serial"
+# connection = "max3100"
 
-# camera = uCAM_III_MAX3100(spiDevice=(0,0), 
-#                           resetPin=23,
-#                           responseDelay=0.2,
-#                           verbose=True)
+if connection == "serial":
+
+    camera = uCAM_III_Serial(serialDevice="/dev/serial0", 
+                             resetPin=23,
+                             responseDelay=0.2,
+                             syncResponseDelay=0.05)
+
+elif connection == "max3100":
+
+    camera = uCAM_III_MAX3100(spiDevice=(0,0), 
+                              resetPin=23,
+                              responseDelay=0,
+                              syncResponseDelay=0,
+                              verbose=True)
 
 counter = 1
 while True:
     if button_pressed:
-        print("Take photo")
+        print("Connect w/ camera")
         camera.reset()
         assert camera.sync()
         time.sleep(2)
+
+        print("Take photo")
         camera.takephoto()
 
         print("Save photo")
