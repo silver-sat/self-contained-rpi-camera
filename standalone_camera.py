@@ -2,7 +2,7 @@
 # Based on code by Dave Copeland and Xander Hostler
 
 import serial
-import time, os, os.path
+import time, os, os.path, math
 import RPi.GPIO as GPIO
 
 class uCAM_III(object):
@@ -11,17 +11,20 @@ class uCAM_III(object):
     default_resetPin = 23
     # time to wait before reading camera response
     default_responseDelay = 1
-    # time to wait for reading camera reponse to sync
+    # time to wait for reading camera response to sync
     default_syncResponseDelay = 1
     # time to wait between commands
     default_interCommandDelay = 1
+    # time to wait for a response to a command (after the repsonseDelay)
+    default_responseTimeout = 1
+    # JPG size (see below)
+    default_jpgSize = 3
 
     # uCAM III protocol...
     INITIAL = (0xAA,0x01,0x00,0x00,0x00,0x00)
-    # INITIAL_JPEG = (0xAA,0x01,0x00,0x07,0x07,0x03)  # 160x128 format      
-    # INITIAL_JPEG = (0xAA,0x01,0x00,0x07,0x07,0x05)  # 320x240 format      
-    INITIAL_JPEG = (0xAA,0x01,0x00,0x07,0x07,0x07)  # 640x480 format      
-    SET_PKG_SIZE = (0xAA,0x06,0x08,0x00,0x02,0x00)
+    INITIAL_JPEG_1 = (0xAA,0x01,0x00,0x07,0x07,0x03)  # 160x128 format      
+    INITIAL_JPEG_2 = (0xAA,0x01,0x00,0x07,0x07,0x05)  # 320x240 format      
+    INITIAL_JPEG_3 = (0xAA,0x01,0x00,0x07,0x07,0x07)  # 640x480 format      
     SNAPSHOT = (0xAA,0x05,0x00,0x00,0x00,0x00)
     GETPICTURE = (0xAA,0x04,0x01,0x00,0x00,0x00)
     FULL_RESET = (0xAA,0x08,0x00,0x00,0x00,0x00)
@@ -30,13 +33,22 @@ class uCAM_III(object):
     LIGHT = (0xAA,0x13,0x01,0x00,0x00,0x00)
     EXPSETTINGS = (0xAA,0x14,0x02,0x02,0x02,0x00)
 
-    pkgSize = 512
+    BAUD_9600 = (0xAA,0x07,0x1F,0x0B,0x00,0x00)
+    # 57600 in data-sheet
+    BAUD_56000 = (0xAA,0x07,0x1F,0x01,0x00,0x00)
+
+    PKGSIZE_512 = (0xAA,0x06,0x08,0x00,0x02,0x00)
+    PKGSIZE_256 = (0xAA,0x06,0x08,0x00,0x01,0x00)
+    PKGSIZE_128 = (0xAA,0x06,0x08,0x80,0x00,0x00)
+    PKGSIZE_64  = (0xAA,0x06,0x08,0x40,0x00,0x00)
 
     def __init__(self,**kw):
         self.resetPin = kw.get('resetPin',self.default_resetPin)
         self.responseDelay = kw.get('responseDelay',self.default_responseDelay)
+        self.responseTimeout = kw.get('responseTimeout',self.default_responseTimeout)
         self.syncResponseDelay = kw.get('syncResponseDelay',self.default_syncResponseDelay)
         self.interCommandDelay = kw.get('interCommandDelay',self.default_interCommandDelay)
+        self.jpgSize = kw.get('jpgSize',self.default_jpgSize)
         self.verbose = kw.get('verbose',False)
         GPIO.setup(self.resetPin,GPIO.OUT)
 
@@ -50,17 +62,23 @@ class uCAM_III(object):
 
     def command(self,bytes,**kw):
         responseDelay = kw.get('responseDelay',self.responseDelay)
+        responseTimeout = kw.get('responseTimeout',self.responseTimeout)
         verbose=kw.get('verbose',self.verbose)
         wait=kw.get('wait',True)
+        verify=kw.get('verify',False)
+        expectedLen = kw.get('expectedLen',1)
         if verbose:
             print("Write:",len(bytes),":"," ".join(map(lambda b: "%02X"%b,bytes)))
         self.write(bytes)
         time.sleep(responseDelay)
+        timeout = time.time()+responseTimeout
         retval = self.read()
-        while wait and len(retval) == 0:
-            retval = self.read()
+        while wait and len(retval) < expectedLen and time.time()<timeout:
+            retval += self.read()
         if verbose:
             print("Read: ",len(retval),":"," ".join(map(lambda b: "%02X"%b,retval)))
+        if verify:
+            self.check_ack(retval,bytes[1])
         return retval
 
     def check_ack(self,reply,cmd):
@@ -77,34 +95,66 @@ class uCAM_III(object):
         delayValue = 0.005
         delayIncrement = 0.001
     
-        while (currentTry < maxTries) and (len(reply) != 12 or not self.check_sync_ack(reply)):
+        while (currentTry < maxTries) and (len(reply) != 12 or not self.check_sync_ack(reply[:6])):
             # print("Sync attempt:",currentTry)
             delayValue += delayIncrement
             reply = self.command(self.SYNC, responseDelay=syncResponseDelay, wait=False)
             currentTry +=1
 
-        if len(reply) != 12 or not self.check_sync_ack(reply):
+        if len(reply) != 12 or not self.check_sync_ack(reply[:6]):
             # Didn't work
-            print("Sync didn't work. Sent %d tries" % currentTry)
+            if self.verbose:
+                print("Sync didn't work. Sent %d tries" % currentTry)
             return False
 
         # it did work
-        print("Camera replied", reply, "attempts:",currentTry)
-        # send the ACK back to camera        
-        bytes = self.ACK+(0x0D,0x00,0x00,0x00)
         if self.verbose:
-            print("Write:",len(bytes),":"," ".join(map(lambda b: "%02X"%b,bytes)))
-        response = self.write(bytes)
+            print("Camera replied", " ".join(map(lambda b: "%02X"%b,reply)), "attempts:",currentTry)
+        
+        # send the ACK back to camera        
+        self.sendack(reply[6:][1])
         return True
 
+    def sendack(self,cmd):
+        bytes = self.ACK+(cmd,0x00,0x00,0x00)
+        if self.verbose:
+            print("Write:",len(bytes),":"," ".join(map(lambda b: "%02X"%b,bytes)))
+        self.write(bytes)
+
+    def check_sync(self):
+        reply = self.command(self.SYNC)
+        if len(reply) != 12 or not self.check_sync_ack(reply[:6]):
+            return False
+        self.sendack(reply[6:][1])
+        return True
+
+    def set_jpg(self,size):
+        jpg_const = "INITIAL_JPEG_%s"%(size,)
+        assert hasattr(self,jpg_const), "No uCAM_III.%s constant"%(jpg_const,)
+        reply = self.command(getattr(self,jpg_const))
+        assert self.check_ack(reply,self.INITIAL_JPEG_1[1])
+
+    def set_baud(self,baud):
+        baud_const = "BAUD_%s"%(baud,)
+        assert hasattr(self,baud_const), "No uCAM_III.%s constant"%(baud_const,)
+        reply = self.command(getattr(self,baud_const),expectedLen=6)
+        assert self.check_ack(reply,self.BAUD_9600[1])
+
+    def set_package_size(self,size):
+        size_const = "PKGSIZE_%s"%(size,)
+        assert hasattr(self,size_const), "No uCAM_III.%s constant"%(size_const,)
+        reply = self.command(getattr(self,size_const))
+        assert self.check_ack(reply,self.PKGSIZE_512[1])
+
     def takephoto(self):
-        reply = self.command(self.INITIAL_JPEG)
         time.sleep(self.interCommandDelay)
-        reply = self.command(self.SET_PKG_SIZE)
+        self.set_jpg(self.jpgSize)
         time.sleep(self.interCommandDelay)
-        reply = self.command(self.EXPSETTINGS)
+        self.set_package_size(self.pkgSize)
         time.sleep(self.interCommandDelay)
-        reply = self.command(self.SNAPSHOT)
+        self.command(self.EXPSETTINGS,verify=True)
+        time.sleep(self.interCommandDelay)
+        self.command(self.SNAPSHOT,verify=True)
 
     def retrieveDataFromPkg(self,pkg):
         # pkgID = pkg[0:2]
@@ -117,36 +167,61 @@ class uCAM_III(object):
         return response[-1]*256*256+response[-2]*256+response[-3]
 
     def getPicture(self):
-        camReply = self.command(self.GETPICTURE)
-        # print("Wrote GETPICTURE. Camera replied",camReply)
+        pictureArray = None
+        imageSize = None
+        numPackages = None
+        goodpkg = 0
+        for attempt in range(0,10):
+            camReply = self.command(self.GETPICTURE)
+            # print("Wrote GETPICTURE. Camera replied",camReply)
+            while len(camReply) < 12: # ACK + DATA command response
+                camReply += self.read()
+            if self.verbose:
+                print("Read: ",len(camReply),":"," ".join(map(lambda b: "%02X"%b,camReply)))
 
-        replyLen=len(camReply)
-        imageSize = camReply[replyLen-1]*256*256+camReply[replyLen-2]*256+camReply[replyLen-3]
-        print("Picture size:",imageSize,"bytes")
+            if imageSize == None:
+                replyLen=len(camReply)
+                imageSize = camReply[replyLen-1]*256*256+camReply[replyLen-2]*256+camReply[replyLen-3]
+                print("Picture size:",imageSize,"bytes")
+                numPackages = int(math.ceil(imageSize/(self.pkgSize-6)))
+                pictureArray = [b'']*numPackages
 
-        numPackages = int(imageSize/(self.pkgSize-6))+1
-        # start the download by ACKing back
-        pkgCounter0 = 0
-        pkgCounter1 = 0  # I'm cheating and assuming num packages < 255!!
-        byteCounter = 0
-        pictureArray = b''
-
-        for indx in range(0,numPackages):
-            pkgCounter0 = indx
-            ackResponse = self.ACK+(0,0,pkgCounter0,pkgCounter1)
-            while True:
-                pkg = self.command(ackResponse)
+            for indx in range(numPackages):
+                ackResponse = self.ACK+(0,0,indx,0)
+                if indx < (numPackages-1):
+                    expectedLen = self.pkgSize
+                else:
+                    expectedLen = imageSize-(numPackages-1)*(self.pkgSize-6)+6
+                pkg = self.command(ackResponse,expectedLen=expectedLen)
                 pkgID0 = pkg[0]
                 pkgID1 = pkg[1]
-                print("Received package %d %d - size %d bytes" % (pkgID1,pkgID0,len(pkg)))
-                # the only tell for bad packet we have is if the package is short
-                if len(pkg) == min(self.pkgSize,imageSize-len(pictureArray)+6):
-                    break
+                pkgdatalen = pkg[2]+256*pkg[3]
+                pkgverify = pkg[-2]
+                verify = (sum(pkg[:-2])&0xff)
+                   
+                if pkgID0 == (indx+1) and pkgverify == verify and len(pkg) == expectedLen and (pkgdatalen+6) == expectedLen:
+                    if pictureArray[indx] == b"":
+                        pictureArray[indx] = self.retrieveDataFromPkg(pkg)
+                        goodpkg += 1
+                        print("Received package %3d (%3d/%3d): %6.2f%% (pass %d)" % (indx+1,goodpkg,numPackages,100.0*goodpkg/numPackages,attempt+1))
+                        if goodpkg == numPackages:
+                            break
+                else:
+                    pass # print("Bad package %d %d - exp. size %d, actual size %d, pkgvfy %d, sumvfy: %d" % (indx+1,pkgID0,expectedLen,len(pkg),pkgverify,verify))
+                # time.sleep(self.interCommandDelay)
 
-            pictureArray += self.retrieveDataFromPkg(pkg)
-            print("Received %6.2f%%" % (100.0*len(pictureArray)/imageSize,))
+            bytes = self.ACK+(0,0,0xF0,0xF0)
+            if self.verbose:
+                print("Write:",len(bytes),":"," ".join(map(lambda b: "%02X"%b,bytes)))
+            self.write(bytes)
 
-        print("Received - %d  bytes" % len(pictureArray))    
+            if goodpkg == numPackages:
+                break
+
+        assert goodpkg == numPackages
+
+        pictureArray = b''.join(pictureArray)
+        print("Received - %d/%d  bytes" % (imageSize,len(pictureArray)))
         return pictureArray
 
     def savePicture(self,filename):
@@ -162,11 +237,12 @@ class uCAM_III(object):
 class uCAM_III_Serial(uCAM_III):
     # Constants
     default_baudRate = 56000
+    pkgSize = 512
 
     # initialize
     def __init__(self,serialDevice,**kw):
-        baudRate = kw.get('baudRate',self.default_baudRate)
-        self.serialPort = serial.Serial(serialDevice,baudRate)
+        self.baudRate = kw.get('baudRate',self.default_baudRate)
+        self.serialPort = serial.Serial(serialDevice,self.baudRate)
         super(uCAM_III_Serial,self).__init__(**kw)
 
     def read(self):
@@ -186,17 +262,16 @@ import max3100
 
 class uCAM_III_MAX3100(uCAM_III):
     # Constants
-    # default_baudRate = 38400
-    # default_baudRate = 19200
     default_baudRate = 9600
+    pkgSize = 512
 
     # initialize
     def __init__(self,spiDevice,**kw):
-        baudRate = kw.get('baudRate',self.default_baudRate)
+        self.baudRate = kw.get('baudRate',self.default_baudRate)
         # other MAX3100 parameters are set to default values
         self.max3100 = max3100.MAX3100(spiif=spiDevice[0],
                                        spiselect=spiDevice[1],
-                                       baud=baudRate)
+                                       baud=self.baudRate)
         super(uCAM_III_MAX3100,self).__init__(**kw)
 
     def read(self):
@@ -230,41 +305,62 @@ def button_callback(channel):
 
 button = Button(buttonPin=24, callback=button_callback)
 
-connection = "serial"
-# connection = "max3100"
+# connection = "serial"
+connection = "max3100"
+# verbose = True
+verbose = False
 
 if connection == "serial":
 
     camera = uCAM_III_Serial(serialDevice="/dev/serial0", 
                              resetPin=23,
                              responseDelay=0.2,
-                             syncResponseDelay=0.05)
+                             syncResponseDelay=0.05,
+                             verbose=verbose)
 
 elif connection == "max3100":
 
     camera = uCAM_III_MAX3100(spiDevice=(0,0), 
                               resetPin=23,
                               responseDelay=0,
-                              syncResponseDelay=0,
-                              verbose=True)
+                              syncResponseDelay=0.01,
+                              verbose=verbose)
+
+attempt = 0
+while True:
+    print("Connect w/ camera, attempt",attempt+1)
+    attempt += 1
+    camera.reset()
+    try:
+        camera.sync()
+    except:
+        time.sleep(1)
+        continue
+    try:
+        camera.set_baud(camera.baudRate)
+    except:
+        time.sleep(1)
+        continue
+    break
+
+time.sleep(2)
 
 counter = 1
 while True:
     if button_pressed:
-        print("Connect w/ camera")
-        camera.reset()
-        assert camera.sync()
-        time.sleep(2)
-
         print("Take photo")
         camera.takephoto()
+
+        time.sleep(2)
 
         print("Save photo")
         filename = 'testPic-%03d.jpg'%(counter,)
         camera.savePicture(filename)
         counter += 1
 
-        button_pressed = False
+        time.sleep(10)
+
+        # button_pressed = False
 
     time.sleep(.1)
 

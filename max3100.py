@@ -51,18 +51,16 @@ class MAX3100(object):
 
     def __init__(self,spiif=0,spiselect=0,spispeed=7800000,
                       crystal_kHz=3686,baud=9600):
-        assert hasattr(self,f"CRYSTAL_{crystal_kHz}_kHz"), f"No MAX3100.CRYSTAL_{crystal_kHz}_kHz constant"
-        crystal = getattr(self,f"CRYSTAL_{crystal_kHz}_kHz")
-        assert hasattr(self,f"CONF_BAUD_X{crystal}_{baud}"), f"No MAX3100.CONF_BAUD_X{crystal}_{baud} constant"
+        crystal_const = "CRYSTAL_%s_kHz"%(crystal_kHz,)
+        assert hasattr(self,crystal_const), "No MAX3100.%s constant"%(crystal_const,)
+        self.crystal = getattr(self,crystal_const)
                 
         self.spi = spidev.SpiDev()
         self.spi.open(spiif,spiselect)
         self.spi.max_speed_hz = spispeed
         self.spi.mode = 0b00
 
-        conf = getattr(self,f"CONF_BAUD_X{crystal}_{baud}")
-        word = ( self.CMD_WRITE_CONF | self.CONF_RM | conf )
-        self.xferword(word)
+        self.set_baud(baud)
 
     @staticmethod
     def tobytearray(words):
@@ -87,6 +85,13 @@ class MAX3100(object):
         if msg:
             self.print_word(msg+":read",rword)
         return rword
+
+    def set_baud(self,baud):
+        baud_const = "CONF_BAUD_X%s_%s"%(self.crystal,baud)
+        assert hasattr(self,baud_const), "No MAX3100.%s constant"%(baud_const,)
+        conf = getattr(self,baud_const)
+        word = ( self.CMD_WRITE_CONF | self.CONF_RM | conf )
+        self.xferword(word)
 
     readcmd = tobytearray.__func__([CMD_READ_DATA])
     def readbytes(self):
